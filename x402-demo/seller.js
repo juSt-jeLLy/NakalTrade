@@ -1,11 +1,12 @@
 import express from "express";
 import { paymentMiddleware } from "x402-express";
+import "dotenv/config";
 // import { facilitator } from "@coinbase/x402"; // For mainnet
 
 const app = express();
 
 app.use(paymentMiddleware(
-  "0xdB772823f62c009E6EC805BC57A4aFc7B2701F1F", // receiving wallet address
+  process.env.PAYMENT_ADDRESS, // receiving wallet address
   {  // Route configurations for protected endpoints
     "GET /weather": {
       // USDC amount in dollars

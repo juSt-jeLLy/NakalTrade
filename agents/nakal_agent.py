@@ -3,12 +3,14 @@ import sys
 import re
 import httpx
 import time
+import hashlib
 import asyncio
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 
 from uagents import Agent, Context, Model
 import requests
+from agent_wallet import AgentWallet
 
 # Load environment variables
 load_dotenv()
@@ -24,7 +26,7 @@ agent = Agent(
 # ASI:One Mini configuration
 ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY")
 ASI_ONE_URL = "https://api.asi1.ai/v1/chat/completions"
-ONEINCH_PROXY_URL = os.getenv("1INCH_PROXY_URL", )
+ONEINCH_PROXY_URL = os.getenv("1INCH_PROXY_URL")
 
 
 # Simple Models
@@ -92,279 +94,322 @@ class OneInchPortfolioClient:
         return await self._make_request(self.balance_base_url, "", addresses, chain_id)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Agent Lifecycle
+# Agent Globals
 # ────────────────────────────────────────────────────────────────────────────────
 
 one_inch_client: Optional[OneInchPortfolioClient] = None
-
-# Store recent agent messages (keep last 50)
+agent_wallet: Optional[AgentWallet] = None
+active_copy_trades: Dict[str, Any] = {}
 agent_messages: List[AgentMessage] = []
 MAX_MESSAGES = 50
 
 # Supported chains for 1inch Portfolio API
 CHAIN_NAME_TO_ID = {
-    "ethereum": 1,
-    "eth": 1,
-    "arbitrum": 42161,
-    "arb": 42161,
-    "bnb chain": 56,
-    "bnb": 56,
-    "bsc": 56,
-    "binance smart chain": 56,
-    "gnosis": 100,
-    "optimism": 10,
-    "polygon": 137,
-    "matic": 137,
-    "base": 8453,
-    "zksync era": 324,
-    "linea": 59144,
-    "avalanche": 43114,
-    "avax": 43114,
+    "ethereum": 1, "eth": 1, "arbitrum": 42161, "arb": 42161,
+    "bnb chain": 56, "bnb": 56, "bsc": 56, "binance smart chain": 56,
+    "gnosis": 100, "optimism": 10, "polygon": 137, "matic": 137,
+    "base": 8453, "zksync era": 324, "linea": 59144,
+    "avalanche": 43114, "avax": 43114,
 }
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Agent Lifecycle & Endpoints
+# ────────────────────────────────────────────────────────────────────────────────
 
 @agent.on_event("startup")
 async def startup(ctx: Context):
-    global one_inch_client
-    ctx.logger.info("🌟 NakalTrade Agent Starting")
-    ctx.logger.info(f"📍 Address: {agent.address}")
-    ctx.logger.info("🤖 Using 1inch API for Portfolio Analysis")
+    global one_inch_client, agent_wallet
+    ctx.logger.info("🌟 NakalTrade Agent Starting with Copy Trading")
     
-    # Check if API key is configured
     if not ASI_ONE_API_KEY:
-        ctx.logger.warning("⚠️ ASI_ONE_API_KEY not found in environment. Please set it in your .env file.")
+        ctx.logger.warning("⚠️ ASI_ONE_API_KEY not found. Analysis will be limited.")
     else:
         ctx.logger.info("✅ ASI:One API key configured")
     
+    if not os.getenv("PAYMENT_ADDRESS"):
+        ctx.logger.warning("⚠️ PAYMENT_ADDRESS not found. x402 service may fail.")
+        
     one_inch_client = OneInchPortfolioClient(ctx)
-    ctx.logger.info("✨ Ready!")
+    
+    ctx.logger.info("💰 Initializing agent wallet for copy trading...")
+    agent_wallet = AgentWallet()
+    agent_wallet.initialize()
+    wallet_info = agent_wallet.get_wallet_info()
+    ctx.logger.info(f"💳 Agent wallet ready: {wallet_info['address']}")
+    ctx.logger.info("✨ Agent is ready!")
 
 @agent.on_rest_post("/chat", ChatRequest, ChatResponse)
 async def chat_endpoint(ctx: Context, req: ChatRequest) -> ChatResponse:
-    """Chat endpoint that uses 1inch API for portfolio analysis"""
-    global agent_messages
-    ctx.logger.info(f"💬 Chat: {req.message}")
+    ctx.logger.info(f"💬 Chat received: {req.message}")
     
-    # Handle analysis requests, e.g., "analyze 0x... on polygon"
-    analysis_match = re.search(r"analyze\s+(0x[a-fA-F0-9]{40})", req.message, re.IGNORECASE)
+    message = req.message.lower()
+    response = ""
+
+    # Command: analyze {address} on {chain}
+    analysis_match = re.search(r"analyze\s+(0x[a-fA-F0-9]{40})", message)
     if analysis_match:
-        wallet_address = analysis_match.group(1)
-        
-        # Use LLM to intelligently parse the chain from the user's message
-        chain_name = await parse_chain_with_gpt(req.message)
-        
-        if chain_name not in CHAIN_NAME_TO_ID:
-            # Fallback or error if the LLM returns an unsupported chain
-            response = f"Sorry, I don't support the '{chain_name}' chain. Supported chains are: {', '.join(CHAIN_NAME_TO_ID.keys())}"
-            return ChatResponse(response=response)
+        response = await handle_analysis(ctx, req.message, analysis_match)
 
-        chain_id = CHAIN_NAME_TO_ID[chain_name]
-        ctx.logger.info(f"📈 Initiating portfolio analysis for {wallet_address} on {chain_name} (ID: {chain_id})")
+    # Command: copy_trade {token_symbol}
+    elif message.startswith("copy_trade"):
+        response = await handle_copy_trade_start(ctx, message)
 
-        # Concurrently fetch all required data points from the 1inch API
-        pnl_data, value_data, details_data, balance_data = await asyncio.gather(
-            one_inch_client.get_erc20_pnl(addresses=[wallet_address], chain_id=chain_id),
-            one_inch_client.get_current_value(addresses=[wallet_address], chain_id=chain_id),
-            one_inch_client.get_token_details(addresses=[wallet_address], chain_id=chain_id),
-            one_inch_client.get_token_balances(addresses=[wallet_address], chain_id=chain_id)
-        )
-
-        # Check for errors in any of the API responses
-        if "error" in pnl_data or "error" in value_data or "error" in details_data or "error" in balance_data:
-            response = f"❌ Error fetching portfolio data from 1inch. Please try again later."
-            ctx.logger.error(f"1inch API Errors: PnL({pnl_data.get('error')}), Value({value_data.get('error')}), Details({details_data.get('error')}), Balance({balance_data.get('error')})")
-        else:
-            # Combine data and use LLM to parse and summarize the results
-            combined_data = {
-                "pnl": pnl_data,
-                "value": value_data,
-                "details": details_data,
-                "balances": balance_data,
-            }
-            response = await parse_pnl_with_gpt(wallet_address, chain_name, combined_data)
-
-        # Store and return response
-        agent_msg = AgentMessage(agent_name="NakalTrade", message=response, timestamp=time.time())
-        agent_messages.append(agent_msg)
-        if len(agent_messages) > MAX_MESSAGES:
-            agent_messages = agent_messages[-MAX_MESSAGES:]
-        return ChatResponse(response=response)
-
-    # Fallback for unhandled messages
-    response = "Sorry, I can only analyze wallets (e.g., 'analyze 0x... on eth')."
+    # Command: execute {payment_id}
+    elif message.startswith("execute"):
+        response = await handle_copy_trade_execute(ctx, message)
     
-    # Store agent's response
-    agent_msg = AgentMessage(
-        agent_name="NakalTrade",
-        message=response,
-        timestamp=time.time()
-    )
-    agent_messages.append(agent_msg)
-    
-    # Keep only last MAX_MESSAGES
-    if len(agent_messages) > MAX_MESSAGES:
-        agent_messages = agent_messages[-MAX_MESSAGES:]
-    
+    # Command: wallet
+    elif message == "wallet":
+        response = handle_wallet_info()
+
+    else:
+        response = "Sorry, I didn't understand. Try 'analyze {address} on {chain}' or 'wallet'."
+
+    # Store and return the response
+    store_agent_message("NakalTrade", response)
     return ChatResponse(response=response)
 
 @agent.on_rest_get("/agent_messages", AgentMessagesResponse)
 async def get_agent_messages(ctx: Context) -> AgentMessagesResponse:
-    """Get recent agent messages for frontend polling"""
-    global agent_messages
     return AgentMessagesResponse(messages=agent_messages)
 
 @agent.on_rest_get("/health", ChatResponse)
 async def health_check(ctx: Context) -> ChatResponse:
-    ctx.logger.info("Health check requested")
     return ChatResponse(response="NakalTrade agent is healthy!")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Command Handlers
+# ────────────────────────────────────────────────────────────────────────────────
+
+async def handle_analysis(ctx: Context, original_message: str, match: re.Match) -> str:
+    wallet_address = match.group(1)
+    chain_name = await parse_chain_with_gpt(original_message)
+    
+    if chain_name not in CHAIN_NAME_TO_ID:
+        return f"Sorry, '{chain_name}' is not a supported chain."
+
+    chain_id = CHAIN_NAME_TO_ID[chain_name]
+    ctx.logger.info(f"📈 Analyzing {wallet_address} on {chain_name} (ID: {chain_id})")
+
+    pnl_data, value_data, details_data, balance_data = await asyncio.gather(
+        one_inch_client.get_erc20_pnl([wallet_address], chain_id),
+        one_inch_client.get_current_value([wallet_address], chain_id),
+        one_inch_client.get_token_details([wallet_address], chain_id),
+        one_inch_client.get_token_balances([wallet_address], chain_id)
+    )
+
+    if any("error" in d for d in [pnl_data, value_data, details_data, balance_data]):
+        return "❌ Error fetching portfolio data from 1inch. Please try again later."
+    
+    combined_data = { "pnl": pnl_data, "value": value_data, "details": details_data, "balances": balance_data }
+    return await parse_pnl_with_gpt(wallet_address, chain_name, combined_data)
+
+
+async def handle_copy_trade_start(ctx: Context, message: str) -> str:
+    token_symbol_match = re.search(r"copy_trade\s+([a-zA-Z0-9]+)", message)
+    if not token_symbol_match:
+        return "Invalid format. Use `copy_trade {TOKEN_SYMBOL}`."
+
+    token_symbol = token_symbol_match.group(1).upper()
+    trade_details = f"1 of {token_symbol}" # Mock amount for now
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "http://localhost:8402/payment/create",
+                params={"item_name": trade_details, "price": 0.01}
+            )
+            if res.status_code != 200:
+                raise Exception(f"Payment service returned status {res.status_code}")
+            
+            payment_data = res.json()
+            payment_id = payment_data["payment_id"]
+            
+            active_copy_trades[payment_id] = {
+                "token": token_symbol,
+                "price": 0.01,
+                "status": "awaiting_payment"
+            }
+            
+            return f"""
+            🚀 **Copy Trade Initiated via x402**
+
+            **Trade:** {trade_details}
+            **Service Fee:** $0.01 USDC
+            **Payment ID:** `{payment_id}`
+
+            To proceed, fund the agent's wallet and type:
+            `execute {payment_id}`
+            """
+    except Exception as e:
+        ctx.logger.error(f"Failed to create x402 payment request: {e}")
+        return "❌ Could not initiate copy trade. The x402 service might be down."
+
+async def handle_copy_trade_execute(ctx: Context, message: str) -> str:
+    payment_id_match = re.search(r"execute\s+([a-zA-Z0-9]+)", message)
+    if not payment_id_match:
+        return "Invalid format. Use `execute {payment_id}`."
+        
+    payment_id = payment_id_match.group(1)
+    if payment_id not in active_copy_trades:
+        return f"❌ Payment ID `{payment_id}` not found or expired."
+
+    trade = active_copy_trades[payment_id]
+    if trade["status"] == "completed":
+        return f"✅ This trade has already been executed."
+
+    ctx.logger.info(f"🤖 Agent executing x402 payment for {payment_id}")
+    
+    try:
+        result = agent_wallet.execute_payment(payment_id, trade["price"])
+        if result and result.status_code == 200:
+            trade["status"] = "completed"
+            return f"✅ **Payment Sent!**\n\nCopy trade for **{trade['token']}** has been executed via x402."
+        else:
+            status_code = result.status_code if result else "unknown"
+            error_text = result.text if result else "No response"
+            return f"❌ Payment failed (status: {status_code}). Check agent wallet balance and x402 service logs.\nDetails: {error_text}"
+    except Exception as e:
+        ctx.logger.error(f"Payment execution error: {e}")
+        return f"❌ An unexpected error occurred during payment execution: {e}"
+
+def handle_wallet_info() -> str:
+    wallet_info = agent_wallet.get_wallet_info()
+    return f"""
+    💰 **Agent Wallet Information**
+
+    **Address:** `{wallet_info['address']}`
+    **Network:** {wallet_info['network']}
+
+    Fund this wallet with USDC on Polygon Amoy to enable copy trading.
+    """
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ────────────────────────────────────────────────────────────────────────────────
+
+def store_agent_message(agent_name: str, message: str):
+    global agent_messages
+    agent_messages.append(AgentMessage(agent_name=agent_name, message=message, timestamp=time.time()))
+    if len(agent_messages) > MAX_MESSAGES:
+        agent_messages = agent_messages[-MAX_MESSAGES:]
 
 async def parse_chain_with_gpt(user_input: str) -> str:
-    """Use ASI:One Mini to parse the blockchain name from user input."""
-    if not ASI_ONE_API_KEY:
-        # Default to ethereum if key is missing
-        return "ethereum"
-
+    if not ASI_ONE_API_KEY: return "ethereum"
     supported_chains = list(CHAIN_NAME_TO_ID.keys())
-
-    prompt = f"""
-From the user's request, identify the blockchain network.
-The request is: "{user_input}"
-
-Choose ONLY from the following list of supported chains: {supported_chains}
-
-- Your response MUST be a single word or phrase from the list.
-- If no specific chain is mentioned, you MUST default to "ethereum".
-- For example, if the user says "on bnb" or "on bsc", you should return "bsc".
-- If the user says "on polygon network", you should return "polygon".
-
-Return ONLY the chain name.
-"""
+    prompt = f"""From the user's request, identify the blockchain network. The request is: "{user_input}"
+Choose ONLY from the following list: {supported_chains}. Default to "ethereum" if unsure. Return ONLY the chain name."""
     try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {ASI_ONE_API_KEY}"
-        }
-        data = {
-            "model": "asi1-mini",
-            "messages": [
-                {"role": "system", "content": f"You are an expert at identifying blockchain names from text. Your response must be one of {supported_chains}."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0,
-        }
-        response = requests.post(ASI_ONE_URL, headers=headers, json=data)
+        response = requests.post(ASI_ONE_URL, headers={"Authorization": f"Bearer {ASI_ONE_API_KEY}", "Content-Type": "application/json"},
+                                 json={"model": "asi1-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0})
         response.raise_for_status()
-        response_json = response.json()
-        
-        if 'choices' in response_json and response_json['choices']:
-            chain = response_json['choices'][0]['message']['content'].strip().lower()
-            # Ensure the returned chain is one of the keys we support
-            if chain in CHAIN_NAME_TO_ID:
-                return chain
+        choice = response.json()['choices'][0]['message']['content'].strip().lower()
+        return choice if choice in CHAIN_NAME_TO_ID else "ethereum"
     except Exception as e:
         print(f"Error parsing chain with LLM: {e}")
-
-    # Fallback to simple regex if LLM fails
-    chain_match = re.search(r"on\s+(\w+\s*\w*)", user_input, re.IGNORECASE)
-    if chain_match:
-        requested_chain = chain_match.group(1).lower().strip()
-        if requested_chain in CHAIN_NAME_TO_ID:
-            return requested_chain
-
-    return "ethereum" # Default fallback
-
+        chain_match = re.search(r"on\s+(\w+\s*\w*)", user_input, re.IGNORECASE)
+        if chain_match:
+            requested_chain = chain_match.group(1).lower().strip()
+            if requested_chain in CHAIN_NAME_TO_ID:
+                return requested_chain
+        return "ethereum"
 
 async def parse_pnl_with_gpt(wallet_address: str, chain_name: str, pnl_data: Dict[str, Any]) -> str:
-    """Use ASI:One Mini to parse and summarize 1inch PnL data."""
     if not ASI_ONE_API_KEY:
         return "⚠️ ASI:One API key not configured. Cannot analyze data."
 
-    # Truncate the data if it's too large to fit in the prompt
+    # Find the top performing token to suggest for a copy trade
+    top_performer_suggestion = ""
+    try:
+        # Check pnl data and ensure it's a list of dicts with 'pnl_usd'
+        if 'pnl' in pnl_data and 'erc20' in pnl_data['pnl'] and isinstance(pnl_data['pnl']['erc20'], list):
+            performers = [
+                token for token in pnl_data['pnl']['erc20']
+                if 'pnl_usd' in token and isinstance(token['pnl_usd'], (int, float))
+                   and 'symbol' in token and token['symbol'].lower() not in ['usdc', 'usdt', 'dai']
+            ]
+            if performers:
+                top_performer = max(performers, key=lambda x: x['pnl_usd'])
+                if top_performer['pnl_usd'] > 0:
+                    top_performer_suggestion = f"""
+                    ---
+                    💡 **Copy Trade Suggestion**
+                    This wallet's top performer is **{top_performer['symbol']}**.
+                    To copy this trade, type: `copy_trade {top_performer['symbol']}`
+                    """
+    except Exception as e:
+        print(f"Could not determine top performer: {e}")
+
+
     pnl_json_str = str(pnl_data)
     if len(pnl_json_str) > 12000:
         pnl_json_str = pnl_json_str[:12000] + "... (data truncated)"
 
     parse_prompt = f"""
-You are an expert DeFi portfolio analyst. Your task is to interpret the combined data from the 1inch Portfolio and Balance APIs for a user's wallet and provide a clear, concise, and actionable summary.
+    You are an expert DeFi portfolio analyst. Your task is to interpret the combined data from the 1inch Portfolio and Balance APIs for a user's wallet and provide a clear, concise, and actionable summary.
 
-USER'S WALLET: {wallet_address}
-CHAIN: {chain_name}
+    USER'S WALLET: {wallet_address}
+    CHAIN: {chain_name}
 
-RAW 1inch PORTFOLIO & BALANCE DATA (JSON):
-{pnl_json_str}
+    RAW 1inch PORTFOLIO & BALANCE DATA (JSON):
+    {pnl_json_str}
 
-**CRITICAL ANALYSIS INSTRUCTIONS:**
+    **CRITICAL ANALYSIS INSTRUCTIONS:**
 
-1.  **Source of Truth for Holdings:** The `balances` data is the definitive source for what the wallet *currently holds*.
-2.  **The Zero-Balance Exclusion Rule:** If a token has a zero or negligible balance in the `balances` data, it **MUST ONLY** be considered for the "Past Trades" section. It **MUST BE EXCLUDED** from the "Top Performers (Currently Held)" and "Top Underperformers (Currently Held)" lists, regardless of its PnL.
-3.  **Explain PnL Composition:** Start with the total portfolio value and total PnL. **Crucially, you must explain that the total PnL is the sum of unrealized gains (on assets still held) and realized gains (from assets already sold).**
-4.  **Special Handling for Stablecoins:**
-    *   Identify common stablecoins (USDC, USDT, DAI).
-    *   **NEVER** list stablecoins under "Top Performers," "Underperformers," or "Past Trades" unless their ROI is abnormally large (e.g., > 10% or < -10%), which would indicate a rare de-pegging event. Normal fluctuations are not trades.
-    *   Instead, you can add a "Notes" section at the end to mention significant stablecoin activity, e.g., "*Note: The wallet has actively used USDC, likely for gas fees or as a temporary store of value between trades.*"
-5.  **Distinguish Realized vs. Unrealized Gains:**
-    *   If a non-stablecoin token appears in `pnl` with a profit but has a zero/non-existent entry in `balances`, classify it as a **"Successful Past Trade"** (Realized Gain).
-    *   Tokens with PnL that are also present in `balances` represent **unrealized gains/losses**.
-6.  **Top Movers (Unrealized):** Identify the top 3 best-performing and top 3 worst-performing **non-stablecoin** tokens that are **currently held**.
-7.  **Past Trades (Realized):** Separately list up to 3 notable "Past Trades" of **non-stablecoin** assets.
-8.  **Detailed Breakdown:** For each token listed, provide: Token `symbol`, `pnl_usd`, `roi`, current `value_usd`, and current `Holding` amount.
-9.  **ETH vs. WETH Nuance:** If both ETH and WETH appear, add a note explaining that WETH is "Wrapped ETH" used for DeFi.
-10. **Actionable Insights:** Base your insights on the most significant trades (realized or unrealized). Explain *why* a trade might be worth copying.
+    1.  **Source of Truth:** Use `balances` for current holdings and `pnl` for historical performance.
+    2.  **Zero-Balance Rule:** If a token has a zero balance, it's a "Past Trade." Do not list it under current holdings.
+    3.  **Explain PnL:** Start with total portfolio value and PnL. Explain that PnL is a mix of realized (sold) and unrealized (held) gains.
+    4.  **Exclude Stablecoins:** Do NOT list USDC, USDT, DAI as top performers or underperformers.
+    5.  **Structure:** Provide "Top Performers (Currently Held)," "Top Underperformers (Currently Held)," and "Successful Past Trades (Realized Gains)."
+    6.  **Actionable Insights:** Base your insights on the most significant trades.
 
-**EXAMPLE OUTPUT:**
-**Portfolio Analysis for `0x...` on Ethereum**
+    **EXAMPLE OUTPUT:**
+    **Portfolio Analysis for `0x...` on Ethereum**
 
-This portfolio is currently valued at **$19.52**, with a total historical profit of **+$147.90 (+0.23%)**.
-This profit is a combination of unrealized gains on current holdings and realized gains from past trades.
+    This portfolio is currently valued at **$19.52**, with a total historical profit of **+$147.90 (+0.23%)**.
+    This profit is a combination of unrealized gains on current holdings and realized gains from past trades.
 
-📈 **Top Performers (Currently Held):**
-*   **ETH:** +$103.95 (+0.77%) | Value: $19.52 | Holding: 0.00485 ETH
+    📈 **Top Performers (Currently Held):**
+    *   **ETH:** +$103.95 (+0.77%) | Value: $19.52 | Holding: 0.00485 ETH
 
-📉 **Top Underperformers (Currently Held):**
-*   *No significant underperforming non-stablecoin assets currently held.*
+    📉 **Top Underperformers (Currently Held):**
+    *   *No significant underperforming non-stablecoin assets currently held.*
 
-🔄 **Successful Past Trades (Realized Gains):**
-*   *No significant past trades of non-stablecoin assets detected.*
+    🔄 **Successful Past Trades (Realized Gains):**
+    *   *No significant past trades of non-stablecoin assets detected.*
 
-💡 **Trade Insights:**
-*   This wallet's primary holding is **ETH**, which is performing modestly. To replicate this, one could consider a similar small ETH position.
-*   The majority of the portfolio's historical profit (`+$147.90`) comes from a combination of the current ETH position and past transactions.
+    💡 **Trade Insights:**
+    *   This wallet's primary holding is **ETH**.
 
-*(Note: The wallet successfully realized gains from USDC transactions, suggesting active use of stablecoins, likely for fee coverage or liquidity purposes.)*
-
-OUTPUT:
-"""
+    Provide your analysis based on the data.
+    """
     try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {ASI_ONE_API_KEY}"
-        }
-        data = {
-            "model": "asi1-mini",
-            "messages": [
-                {"role": "system", "content": "You are a helpful DeFi analyst that summarizes wallet performance."},
-                {"role": "user", "content": parse_prompt}
-            ]
-        }
-        response = requests.post(ASI_ONE_URL, headers=headers, json=data)
+        response = requests.post(ASI_ONE_URL, headers={"Authorization": f"Bearer {ASI_ONE_API_KEY}", "Content-Type": "application/json"},
+                                 json={"model": "asi1-mini", "messages": [{"role": "user", "content": parse_prompt}], "temperature": 0.2})
         response.raise_for_status()
-        response_json = response.json()
-        
-        if 'choices' in response_json and response_json['choices']:
-            return response_json['choices'][0]['message']['content']
-        else:
-            return "❌ Could not get analysis from LLM."
+        analysis_result = response.json()['choices'][0]['message']['content']
+        return analysis_result + top_performer_suggestion
     except Exception as e:
         return f"❌ Error analyzing data with LLM: {e}"
 
 
 if __name__ == "__main__":
     print("""
-🌟 NakalTrade Agent - 1inch Powered Portfolio Analysis
+🌟 NakalTrade Agent with x402 Copy Trading
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Natural language portfolio analysis via 1inch API
-• Example: "analyze 0xd8da6bf26964af9d7echancho.eth on eth"
-• REST API: POST /chat {"message": "your question"}
+• Analyze wallets: "analyze 0x... on eth"
+• Get wallet info: "wallet"
+• Initiate a trade: "copy_trade {TOKEN_SYMBOL}"
+• Execute payment: "execute {payment_id}"
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     """)
+    # Run the x402 service as a separate process
+    import subprocess
+    service_process = subprocess.Popen([sys.executable, "x402_service.py"])
+    print(f"🚀 Started x402 service with PID: {service_process.pid}")
+    
     agent.run()
+
+    # Clean up the service process on agent shutdown
+    service_process.terminate()
+    service_process.wait()

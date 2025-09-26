@@ -30,6 +30,9 @@ pip install -r requirements.txt
 **ALWAYS follow the 1Inch API documentation:**https://portal.1inch.dev/documentation/
 - Use this documentation when implementing 1Inch API integrations
 
+**ALWAYS follow the  x402 api documentation:**https://x402.gitbook.io/x402
+  - Use this documentation when implementing x402 API integrations
+  - Use this repo for Polygon reference https://github.com/AkshatGada/x402_Polygon/tree/main/demo
 ## 📚 Official Documentation Links for fetch.ai
 
 **Always reference these official Fetch.ai Innovation Lab docs:**
