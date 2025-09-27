@@ -4,10 +4,8 @@ uagents
 # For 1inch Integration
 httpx
 
-# For x402 Copy Trading
-fastapi
-uvicorn
+# For Blockchain Interaction
+web3
 python-dotenv
-git+https://github.com/AkshatGada/x402_Polygon.git@feature/facilitator-amoy#subdirectory=python/x402
-eth-account
 requests
+eth-account
