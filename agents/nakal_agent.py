@@ -19,7 +19,6 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec
 )
 
-
 # Load environment variables
 load_dotenv()
 
@@ -29,9 +28,6 @@ agent = Agent(
     seed="nakal_trade_agent_seed1091091",
     port=8100,
     mailbox=True,
-    #endpoint=[f"http://localhost:{os.getenv('PORT', 8100)}/submit"],
-    #endpoint=("http://127.0.0.1:8100/submit"),
-
 )
 
 # --- Models ---
@@ -39,6 +35,8 @@ class HealthResponse(Model):
     response: str
 
 # --- Constants ---
+MEMECOIN_AGENT_ADDRESS = "agent1q2vze54jft7fcyny7wfarsrttczarskqw3vvfhzgngdz957dmrd27jluvla"
+INSTITUTIONAL_AGENT_ADDRESS = "agent1qvkd7hxrh9p0eq0pg470j6lmkztgmu3ymrjnv65u9mzwsatwvmjrvvfd64s"
 ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY")
 ASI_ONE_URL = "https://api.asi1.ai/v1/chat/completions"
 ONEINCH_PROXY_URL = os.getenv("1INCH_PROXY_URL")
@@ -46,7 +44,7 @@ PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS")
 AGENT_PRIVATE_KEY = os.getenv("AGENT_PRIVATE_KEY")
 POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY")
 AMOY_USDC_CONTRACT = "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582"
-MOCK_TOKEN_ADDRESS = "0x33432627F302E9C6a3f62ACf7CB581AD57E109dB" # CORRECTED Mock Token Address
+MOCK_TOKEN_ADDRESS = "0x33432627F302E9C6a3f62ACf7CB581AD57E995dB" # CORRECTED Mock Token Address
 
 # --- Globals ---
 one_inch_client: Optional[any] = None
@@ -70,9 +68,6 @@ CHAIN_ID_TO_USDC_ADDRESS = {
     43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", # Avalanche
 }
 
-# The static map is no longer needed, we will search dynamically.
-# MAP_TOKEN_SYMBOL_TO_ADDRESS = ...
-
 USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d59Cf01"
 
 # Initialize the chat protocol
@@ -90,6 +85,46 @@ async def startup(ctx: Context):
     else:
         ctx.logger.info("✅ All configurations for copy trading are set.")
     ctx.logger.info("✨ Agent is ready!")
+
+async def get_memecoin_analysis(prompt: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                ASI_ONE_URL,
+                headers={"Authorization": f"Bearer {ASI_ONE_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "asi1-mini",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant who only answers questions about memecoins. You are a more risky trader and like to make big PnL."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 2048,
+                }
+            )
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Error getting memecoin analysis: {e}"
+
+async def get_institutional_analysis(prompt: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                ASI_ONE_URL,
+                headers={"Authorization": f"Bearer {ASI_ONE_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "asi1-mini",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant who only answers questions about blue chip crypto tokens like btc and eth. You prefer to make safer trades for the long term to not lose a lot of money."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 2048,
+                }
+            )
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Error getting institutional analysis: {e}"
 
 @chat_proto.on_message(ChatMessage)
 async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
@@ -111,36 +146,35 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         return
 
     message = text.lower()
-    response_text = ""
 
     analysis_match = re.search(r"analyze\s+(0x[a-fA-F0-9]{40})", message)
     copy_trade_match = re.search(r"copytrade\s+([a-zA-Z0-9]+)\s+with address\s+(0x[a-fA-F0-9]{40})(?:\s+with volume\s+([\d\.]+)\s+usd)?", message, re.IGNORECASE)
 
     if analysis_match:
-        response_text = await handle_analysis(ctx, message, analysis_match)
+        await orchestrate_analysis(ctx, sender, message, analysis_match)
     elif copy_trade_match:
         response_text = await handle_copy_trade(ctx, copy_trade_match, sender)
+        response_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=response_text)])
+        await ctx.send(sender, response_msg)
     else:
         response_text = "Sorry, I didn't understand. Try 'analyze {address} on {chain}' or 'copytrade {TOKEN} with address {YOUR_ADDRESS}'."
-
-    # Send response message
-    response_message = ChatMessage(
-        timestamp=datetime.utcnow(),
-        msg_id=uuid4(),
-        content=[TextContent(type="text", text=response_text)]
-    )
-    await ctx.send(sender, response_message)
+        response_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=response_text)])
+        await ctx.send(sender, response_msg)
 
 @chat_proto.on_message(ChatAcknowledgement)
 async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
     ctx.logger.info(f"Received acknowledgement from {sender} for message: {msg.acknowledged_msg_id}")
 
-async def handle_analysis(ctx: Context, original_message: str, match: re.Match) -> str:
+async def orchestrate_analysis(ctx: Context, original_sender: str, original_message: str, match: re.Match):
+    await ctx.send(original_sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text="📈 Analysis in progress... Consulting with internal expert modules.")]))
+
     wallet_address = match.group(1)
     chain_name = await parse_chain_with_gpt(original_message)
     
     if chain_name not in CHAIN_NAME_TO_ID:
-        return f"Sorry, '{chain_name}' is not a supported chain."
+        error_msg = f"Sorry, '{chain_name}' is not a supported chain."
+        await ctx.send(original_sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=error_msg)]))
+        return
 
     chain_id = CHAIN_NAME_TO_ID[chain_name]
     ctx.logger.info(f"📈 Analyzing {wallet_address} on {chain_name} (ID: {chain_id})")
@@ -153,11 +187,12 @@ async def handle_analysis(ctx: Context, original_message: str, match: re.Match) 
     )
 
     if any("error" in d for d in [pnl_data, value_data, details_data, balance_data]):
-        return "❌ Error fetching portfolio data from 1inch. Please try again later."
+        error_msg = "❌ Error fetching portfolio data from 1inch. Please try again later."
+        await ctx.send(original_sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=error_msg)]))
+        return
     
     combined_data = { "pnl": pnl_data, "value": value_data, "details": details_data, "balances": balance_data }
     
-    # Store the context of the successful analysis
     global last_analyzed_chain
     last_analyzed_chain = {
         "chain_id": chain_id,
@@ -165,42 +200,37 @@ async def handle_analysis(ctx: Context, original_message: str, match: re.Match) 
         "timestamp": time.time()
     }
 
-    return await parse_pnl_with_gpt(wallet_address, chain_name, combined_data)
-
-
-def find_token_in_analysis_data(token_symbol: str) -> Optional[Dict[str, Any]]:
-    global last_analyzed_chain
-    if not last_analyzed_chain or time.time() - last_analyzed_chain.get("timestamp", 0) > 600: # 10 minute expiry
-        return None
-
-    data = last_analyzed_chain.get("data", {})
-    chain_id = last_analyzed_chain.get("chain_id")
-    chain_name = last_analyzed_chain.get("chain_name")
-
-    search_areas = [
-        data.get("details", {}).get("erc20", []),
-        data.get("pnl", {}).get("erc20", [])
-    ]
+    prompt_data = json.dumps(combined_data)
+    if len(prompt_data) > 12000:
+        prompt_data = prompt_data[:12000] + "... (data truncated)"
     
-    for area in search_areas:
-        if isinstance(area, list):
-            for token in area:
-                if token.get("symbol", "").upper() == token_symbol.upper():
-                    return {
-                        "address": token.get("address"),
-                        "chain_id": chain_id,
-                        "chain_name": chain_name,
-                    }
-    
-    if "balances" in data and isinstance(data["balances"], dict):
-        for address, token_data in data["balances"].items():
-             if isinstance(token_data, dict) and token_data.get("symbol", "").upper() == token_symbol.upper():
-                return {
-                    "address": address,
-                    "chain_id": chain_id,
-                    "chain_name": chain_name,
-                }
-    return None
+    prompt = f"Please provide an analysis of the following portfolio data for wallet {wallet_address} on {chain_name}: {prompt_data}"
+
+    # Run all three analyses in parallel
+    nakal_analysis_task = parse_pnl_with_gpt(wallet_address, chain_name, combined_data)
+    memecoin_analysis_task = get_memecoin_analysis(prompt)
+    institutional_analysis_task = get_institutional_analysis(prompt)
+
+    nakal_analysis, memecoin_analysis, institutional_analysis = await asyncio.gather(
+        nakal_analysis_task,
+        memecoin_analysis_task,
+        institutional_analysis_task
+    )
+
+    final_response_text = f"""
+**NakalTrade Analysis:**
+{nakal_analysis}
+
+---
+**Memecoin Trader Analysis (High Risk):**
+{memecoin_analysis}
+
+---
+**Institutional Crypto Analysis (Low Risk):**
+{institutional_analysis}
+"""
+    final_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=final_response_text)])
+    await ctx.send(original_sender, final_msg)
 
 async def handle_copy_trade(ctx: Context, match: re.Match, sender: str) -> str:
     token_symbol, user_wallet, volume_str = match.groups()
@@ -289,7 +319,7 @@ async def watch_for_payment(ctx: Context, payment_id: str):
             # CORRECTED: Using the Etherscan V2 universal API with the correct chainid for Amoy.
             api_url = (
                 "https://api.etherscan.io/v2/api"
-                f"?chainid=80002"
+                "?chainid=80002"
                 "&module=account"
                 "&action=tokentx"
                 f"&contractaddress={AMOY_USDC_CONTRACT}"
@@ -367,9 +397,6 @@ def execute_mock_token_transfer(ctx: Context, user_wallet: str, token_symbol: st
     except Exception as e:
         ctx.logger.error(f"Failed to execute mock trade: {e}")
         return f"Failed to send mock token: {e}"
-
-# The store_agent_message function and associated endpoints are no longer needed
-# with the chat protocol handling messaging.
 
 class OneInchPortfolioClient:
     """Client for interacting with the 1inch Portfolio API via a proxy."""

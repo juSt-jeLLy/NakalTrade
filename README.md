@@ -47,3 +47,4 @@ The agent will start up and begin listening for requests on `http://localhost:81
 
 To interact with the agent, open the `frontend.html` file in your web browser. You can now enter queries like `analyze 0x... on eth` to get a detailed performance analysis of any wallet.
 
+
