@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import Image from 'next/image';
 import { Wallet } from '@coinbase/onchainkit/wallet';
 import { Address } from '@coinbase/onchainkit/identity';
 import { useAccount } from 'wagmi';
@@ -70,47 +71,87 @@ export default function Home() {
   };
 
   return (
-    <div className="flex flex-col items-center justify-center h-screen bg-[#1a1a1a]">
-      <div className="chat-container w-full max-w-3xl h-[90vh] max-h-[800px] bg-[#252525] rounded-xl border border-[#333] flex flex-col shadow-lg">
-        <div className="chat-header p-5 bg-[#333] border-b border-[#444] rounded-t-xl flex justify-between items-center">
-          <h1 className="text-2xl font-semibold text-white">NakalTrade Agent</h1>
-          {isConnected ? <Address address={address as `0x${string}`} /> : <Wallet />}
-        </div>
-        <div className="chat-messages flex-1 p-5 overflow-y-auto">
-          {messages.map((msg, index) => (
-            <div key={index} className={`message mb-4 flex ${msg.isUser ? 'justify-end' : 'justify-start'}`}>
-              <div
-                className={`message-content inline-block py-3 px-4 rounded-2xl max-w-[80%] break-words ${
-                  msg.isUser ? 'bg-[#007aff] text-white' : 'bg-[#444] text-[#e0e0e0]'
-                }`}
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '100vh',
+        padding: '1rem',
+      }}
+    >
+      <div
+        className="nes-container with-title is-centered"
+        style={{ width: '90vw', maxWidth: '900px' }}
+      >
+        <Image
+          src="/KnuckleNakal.png"
+          alt="NakalTrade Logo"
+          width={100}
+          height={100}
+          style={{ marginBottom: '1rem' }}
+        />
+        <p className="title">NakalTrade Agent</p>
+        <div
+          className="nes-container"
+          style={{
+            height: '75vh',
+            overflowY: 'auto',
+            marginBottom: '1rem',
+            padding: '1rem',
+          }}
+        >
+          <div className="messages">
+            {messages.map((msg, index) => (
+              <section
+                key={index}
+                className={`message -${msg.isUser ? 'right' : 'left'}`}
+                style={{ maxWidth: '75%' }}
               >
-                {!msg.isUser && <span className="agent-name font-bold block mb-1 text-[#007aff]">{msg.agentName}</span>}
-                <div dangerouslySetInnerHTML={{ __html: msg.content.replace(/\n/g, '<br />') }} />
-              </div>
-            </div>
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
-        {isTyping && <div className="typing-indicator p-3 text-sm italic text-[#aaa]">NakalTrade is analyzing...</div>}
-        <div className="chat-input-container p-5 border-t border-[#333]">
-          <div className="flex gap-3">
-            <input
-              type="text"
-              className="chat-input flex-1 py-3 px-4 bg-[#333] border border-[#555] rounded-full text-base text-white outline-none focus:border-[#007aff] transition-colors"
-              placeholder="e.g., analyze 0x... on eth"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-              disabled={isTyping}
-            />
-            <button
-              className="send-button py-3 px-6 bg-[#007aff] text-white border-none rounded-full text-base font-semibold cursor-pointer transition-colors hover:bg-[#0056b3] disabled:opacity-50 disabled:cursor-not-allowed"
-              onClick={handleSendMessage}
-              disabled={isTyping}
-            >
-              Send
-            </button>
+                <div
+                  className={`nes-balloon from-${
+                    msg.isUser ? 'right' : 'left'
+                  }`}
+                  dangerouslySetInnerHTML={{
+                    __html: `${
+                      !msg.isUser
+                        ? `<span class="nes-text is-primary">${msg.agentName}</span><br>`
+                        : ''
+                    }<span style="color: black;">${msg.content.replace(
+                      /\n/g,
+                      '<br />'
+                    )}</span>`,
+                  }}
+                />
+                {!msg.isUser && (
+                  <p style={{ fontSize: '12px' }}>{msg.agentName}</p>
+                )}
+              </section>
+            ))}
+            <div ref={messagesEndRef} />
           </div>
+        </div>
+        {isTyping && <p className="nes-text is-disabled">NakalTrade is analyzing...</p>}
+        <div className="nes-field is-inline">
+          <input
+            type="text"
+            id="inline_field"
+            className="nes-input"
+            placeholder="e.g., analyze 0x... on eth"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+            disabled={isTyping}
+          />
+          <button
+            type="button"
+            className={`nes-btn ${isTyping ? 'is-disabled' : 'is-primary'}`}
+            onClick={handleSendMessage}
+            disabled={isTyping}
+          >
+            Send
+          </button>
         </div>
       </div>
     </div>

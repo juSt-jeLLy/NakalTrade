@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
 import "./globals.css";
 import { WalletProvider } from "./WalletProvider";
-
-const inter = Inter({ subsets: ["latin"] });
+import "nes.css/css/nes.min.css";
 
 export const metadata: Metadata = {
   title: "NakalTrade Agent",
@@ -17,7 +15,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={inter.className}>
+      <body>
         <WalletProvider>{children}</WalletProvider>
       </body>
     </html>
