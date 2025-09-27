@@ -206,8 +206,8 @@ async def handle_copy_trade(ctx: Context, match: re.Match) -> str:
             return f"❌ Could not fetch the price for {token_symbol} on {chain_name}. Please try again."
         amount_usd = float(price_data["price"])
 
-    # Calculate fee: 0.001% of volume initially
-    fee = amount_usd * 0.00001
+    # Calculate fee: 0.01% of volume initially
+    fee = amount_usd * 0.0001
     
     # If fee exceeds 0.5, scale it down by factors of 10 to preserve price digits
     while fee >= 0.5:
@@ -224,14 +224,15 @@ async def handle_copy_trade(ctx: Context, match: re.Match) -> str:
         "token": token_symbol,
         "user_wallet": user_wallet,
         "status": "watching",
-        "fee_in_smallest_unit": fee_in_smallest_unit
+        "fee_in_smallest_unit": fee_in_smallest_unit,
+        "start_time": time.time()
     }
     
     asyncio.create_task(watch_for_payment(ctx, payment_id))
 
-    trade_amount_str = f"{volume} USD worth of" if volume else "1"
+    trade_amount_str = f"{volume:.2f} USD" if volume else f"1 token"
     return f"""🚀 **Copy Trade Initiated**
-**Trade:** {trade_amount_str} {token_symbol}
+**Mock Trade:** {trade_amount_str} of {token_symbol}
 **Service Fee:** {fee:.4f} USDC
 **Payment ID:** `{payment_id}`
 
@@ -242,26 +243,25 @@ async def watch_for_payment(ctx: Context, payment_id: str):
     if not trade:
         return
 
+    trade_start_time = trade.get("start_time", time.time())
     ctx.logger.info(f"👀 Watching for payment for ID {payment_id} from {trade['user_wallet']}")
     start_time = time.time()
     
     while time.time() - start_time < 300: # 5 minute timeout
         try:
             # CORRECTED: Using the Etherscan V2 universal API with the correct chainid for Amoy.
-            api_url = (
-                f"https://api.etherscan.io/v2/api"
-                f"?chainid=80002"
-                f"&module=account"
-                f"&action=tokentx"
-                f"&contractaddress={AMOY_USDC_CONTRACT}"
-                f"&address={PAYMENT_ADDRESS}"
-                f"&page=1"
-                f"&offset=10"
-                f"&startblock=0"
-                f"&endblock=99999999"
-                f"&sort=desc"
+            api_url = "https://api.etherscan.io/v2/api" + \
+                f"?chainid=80002" + \
+                f"&module=account" + \
+                f"&action=tokentx" + \
+                f"&contractaddress={AMOY_USDC_CONTRACT}" + \
+                f"&address={PAYMENT_ADDRESS}" + \
+                f"&page=1" + \
+                f"&offset=10" + \
+                f"&startblock=0" + \
+                f"&endblock=99999999" + \
+                f"&sort=desc" + \
                 f"&apikey={POLYGONSCAN_API_KEY}"
-            )
 
             async with httpx.AsyncClient() as client:
                 response = await client.get(api_url)
@@ -272,7 +272,8 @@ async def watch_for_payment(ctx: Context, payment_id: str):
                 for tx in data["result"]:
                     if (tx['to'].lower() == PAYMENT_ADDRESS.lower() and
                         tx['from'].lower() == trade['user_wallet'].lower() and
-                        int(tx['value']) == trade['fee_in_smallest_unit']):
+                        int(tx['value']) == trade['fee_in_smallest_unit'] and
+                        int(tx['timeStamp']) > trade_start_time):
                         
                         ctx.logger.info(f"✅ Payment DETECTED for {payment_id} in tx {tx['hash']}")
                         trade['status'] = "completed"
