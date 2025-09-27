@@ -7,11 +7,18 @@ import asyncio
 import hashlib
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
+from datetime import datetime
+from uuid import uuid4
 
-from uagents import Agent, Context, Model
+from uagents import Agent, Context, Protocol, Model
 from web3 import Web3, HTTPProvider
-# The polygonscan library is not working, so we will use httpx for direct API calls.
-# from polygonscan import PolygonScan
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    ChatAcknowledgement,
+    TextContent,
+    chat_protocol_spec
+)
+
 
 # Load environment variables
 load_dotenv()
@@ -19,10 +26,17 @@ load_dotenv()
 # Agent configuration
 agent = Agent(
     name="nakal_trade_agent",
-    seed="nakal_trade_agent_seed_2025",
-    port=int(os.getenv("PORT", 8100)),
-    endpoint=[f"http://localhost:{os.getenv('PORT', 8100)}/submit"],
+    seed="nakal_trade_agent_seed1091091",
+    port=8100,
+    mailbox=True,
+    #endpoint=[f"http://localhost:{os.getenv('PORT', 8100)}/submit"],
+    #endpoint=("http://127.0.0.1:8100/submit"),
+
 )
+
+# --- Models ---
+class HealthResponse(Model):
+    response: str
 
 # --- Constants ---
 ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY")
@@ -34,22 +48,9 @@ POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY")
 AMOY_USDC_CONTRACT = "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582"
 MOCK_TOKEN_ADDRESS = "0x33432627F302E9C6a3f62ACf7CB581AD57E109dB" # CORRECTED Mock Token Address
 
-# --- Models ---
-class ChatRequest(Model):
-    message: str
-class ChatResponse(Model):
-    response: str
-class AgentMessage(Model):
-    agent_name: str
-    message: str
-    timestamp: float
-class AgentMessagesResponse(Model):
-    messages: List[AgentMessage]
-
 # --- Globals ---
 one_inch_client: Optional[any] = None
 active_copy_trades: Dict[str, Any] = {}
-agent_messages: List[AgentMessage] = []
 last_analyzed_chain: Optional[Dict[str, Any]] = None
 MAX_MESSAGES = 50
 CHAIN_NAME_TO_ID = {
@@ -74,11 +75,14 @@ CHAIN_ID_TO_USDC_ADDRESS = {
 
 USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d59Cf01"
 
+# Initialize the chat protocol
+chat_proto = Protocol(spec=chat_protocol_spec)
 
 # --- Agent Logic ---
 @agent.on_event("startup")
 async def startup(ctx: Context):
     global one_inch_client
+    ctx.logger.info(f"My name is {ctx.agent.name} and my address is {ctx.agent.address}")
     ctx.logger.info("🌟 NakalTrade Agent Starting with Automated Payment Detection")
     one_inch_client = OneInchPortfolioClient(ctx)
     if not all([PAYMENT_ADDRESS, AGENT_PRIVATE_KEY, POLYGONSCAN_API_KEY]):
@@ -87,22 +91,49 @@ async def startup(ctx: Context):
         ctx.logger.info("✅ All configurations for copy trading are set.")
     ctx.logger.info("✨ Agent is ready!")
 
-@agent.on_rest_post("/chat", ChatRequest, ChatResponse)
-async def chat_endpoint(ctx: Context, req: ChatRequest) -> ChatResponse:
-    message = req.message.lower()
+@chat_proto.on_message(ChatMessage)
+async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
+    ctx.logger.info(f"Received message from {sender}")
+    # Send acknowledgment
+    ack = ChatAcknowledgement(
+        timestamp=datetime.utcnow(),
+        acknowledged_msg_id=msg.msg_id
+    )
+    await ctx.send(sender, ack)
+
+    text = ""
+    for item in msg.content:
+        if isinstance(item, TextContent):
+            text = item.text
+            break
     
+    if not text:
+        return
+
+    message = text.lower()
+    response_text = ""
+
     analysis_match = re.search(r"analyze\s+(0x[a-fA-F0-9]{40})", message)
     copy_trade_match = re.search(r"copytrade\s+([a-zA-Z0-9]+)\s+with address\s+(0x[a-fA-F0-9]{40})(?:\s+with volume\s+([\d\.]+)\s+usd)?", message, re.IGNORECASE)
 
     if analysis_match:
-        response = await handle_analysis(ctx, req.message, analysis_match)
+        response_text = await handle_analysis(ctx, message, analysis_match)
     elif copy_trade_match:
-        response = await handle_copy_trade(ctx, copy_trade_match)
+        response_text = await handle_copy_trade(ctx, copy_trade_match, sender)
     else:
-        response = "Sorry, I didn't understand. Try 'analyze {address} on {chain}' or 'copytrade {TOKEN} with address {YOUR_ADDRESS}'."
+        response_text = "Sorry, I didn't understand. Try 'analyze {address} on {chain}' or 'copytrade {TOKEN} with address {YOUR_ADDRESS}'."
 
-    store_agent_message("NakalTrade", response)
-    return ChatResponse(response=response)
+    # Send response message
+    response_message = ChatMessage(
+        timestamp=datetime.utcnow(),
+        msg_id=uuid4(),
+        content=[TextContent(type="text", text=response_text)]
+    )
+    await ctx.send(sender, response_message)
+
+@chat_proto.on_message(ChatAcknowledgement)
+async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    ctx.logger.info(f"Received acknowledgement from {sender} for message: {msg.acknowledged_msg_id}")
 
 async def handle_analysis(ctx: Context, original_message: str, match: re.Match) -> str:
     wallet_address = match.group(1)
@@ -171,7 +202,7 @@ def find_token_in_analysis_data(token_symbol: str) -> Optional[Dict[str, Any]]:
                 }
     return None
 
-async def handle_copy_trade(ctx: Context, match: re.Match) -> str:
+async def handle_copy_trade(ctx: Context, match: re.Match, sender: str) -> str:
     token_symbol, user_wallet, volume_str = match.groups()
     token_symbol = token_symbol.upper()
     volume = float(volume_str) if volume_str else None
@@ -225,12 +256,13 @@ async def handle_copy_trade(ctx: Context, match: re.Match) -> str:
         "user_wallet": user_wallet,
         "status": "watching",
         "fee_in_smallest_unit": fee_in_smallest_unit,
-        "start_time": time.time()
+        "start_time": time.time(),
+        "sender": sender
     }
     
     asyncio.create_task(watch_for_payment(ctx, payment_id))
 
-    trade_amount_str = f"{volume:.2f} USD" if volume else f"1 token"
+    trade_amount_str = f"{volume:.2f} USD" if volume else "1 token"
     return f"""🚀 **Copy Trade Initiated**
 **Mock Trade:** {trade_amount_str} of {token_symbol}
 **Service Fee:** {fee:.4f} USDC
@@ -242,6 +274,11 @@ async def watch_for_payment(ctx: Context, payment_id: str):
     trade = active_copy_trades.get(payment_id)
     if not trade:
         return
+        
+    sender = trade.get("sender")
+    if not sender:
+        ctx.logger.error(f"No sender found for payment ID {payment_id}. Cannot send confirmation.")
+        return
 
     trade_start_time = trade.get("start_time", time.time())
     ctx.logger.info(f"👀 Watching for payment for ID {payment_id} from {trade['user_wallet']}")
@@ -250,18 +287,20 @@ async def watch_for_payment(ctx: Context, payment_id: str):
     while time.time() - start_time < 300: # 5 minute timeout
         try:
             # CORRECTED: Using the Etherscan V2 universal API with the correct chainid for Amoy.
-            api_url = "https://api.etherscan.io/v2/api" + \
-                f"?chainid=80002" + \
-                f"&module=account" + \
-                f"&action=tokentx" + \
-                f"&contractaddress={AMOY_USDC_CONTRACT}" + \
-                f"&address={PAYMENT_ADDRESS}" + \
-                f"&page=1" + \
-                f"&offset=10" + \
-                f"&startblock=0" + \
-                f"&endblock=99999999" + \
-                f"&sort=desc" + \
+            api_url = (
+                "https://api.etherscan.io/v2/api"
+                f"?chainid=80002"
+                "&module=account"
+                "&action=tokentx"
+                f"&contractaddress={AMOY_USDC_CONTRACT}"
+                f"&address={PAYMENT_ADDRESS}"
+                "&page=1"
+                "&offset=10"
+                "&startblock=0"
+                "&endblock=99999999"
+                "&sort=desc"
                 f"&apikey={POLYGONSCAN_API_KEY}"
+            )
 
             async with httpx.AsyncClient() as client:
                 response = await client.get(api_url)
@@ -278,8 +317,14 @@ async def watch_for_payment(ctx: Context, payment_id: str):
                         ctx.logger.info(f"✅ Payment DETECTED for {payment_id} in tx {tx['hash']}")
                         trade['status'] = "completed"
                         mock_tx_hash = execute_mock_token_transfer(ctx, trade['user_wallet'], trade['token'])
-                        confirmation_message = f"✅ **Payment Received!**\nYour fee for trade `{payment_id}` was confirmed in tx `{tx['hash'][:10]}...`.\nI have sent you 1 mock {trade['token']} token. Tx: `{mock_tx_hash}`"
-                        store_agent_message("NakalTrade", confirmation_message)
+                        confirmation_message_text = f"✅ **Payment Received!**\nYour fee for trade `{payment_id}` was confirmed in tx `{tx['hash'][:10]}...`.\nI have sent you 1 mock {trade['token']} token. Tx: `{mock_tx_hash}`"
+                        
+                        confirmation_message = ChatMessage(
+                            timestamp=datetime.utcnow(),
+                            msg_id=uuid4(),
+                            content=[TextContent(type="text", text=confirmation_message_text)]
+                        )
+                        await ctx.send(sender, confirmation_message)
                         return
                         
         except Exception as e:
@@ -289,7 +334,13 @@ async def watch_for_payment(ctx: Context, payment_id: str):
 
     if trade.get('status') == "watching":
         ctx.logger.info(f"⌛ Payment request {payment_id} expired.")
-        store_agent_message("NakalTrade", f"Your copy trade request `{payment_id}` has expired.")
+        timeout_message_text = f"Your copy trade request `{payment_id}` has expired."
+        timeout_message = ChatMessage(
+            timestamp=datetime.utcnow(),
+            msg_id=uuid4(),
+            content=[TextContent(type="text", text=timeout_message_text)]
+        )
+        await ctx.send(sender, timeout_message)
         del active_copy_trades[payment_id]
 
 def execute_mock_token_transfer(ctx: Context, user_wallet: str, token_symbol: str) -> str:
@@ -317,11 +368,8 @@ def execute_mock_token_transfer(ctx: Context, user_wallet: str, token_symbol: st
         ctx.logger.error(f"Failed to execute mock trade: {e}")
         return f"Failed to send mock token: {e}"
 
-def store_agent_message(agent_name: str, message: str):
-    global agent_messages
-    agent_messages.append(AgentMessage(agent_name=agent_name, message=message, timestamp=time.time()))
-    if len(agent_messages) > MAX_MESSAGES:
-        agent_messages = agent_messages[-MAX_MESSAGES:]
+# The store_agent_message function and associated endpoints are no longer needed
+# with the chat protocol handling messaging.
 
 class OneInchPortfolioClient:
     """Client for interacting with the 1inch Portfolio API via a proxy."""
@@ -544,13 +592,13 @@ async def parse_pnl_with_gpt(wallet_address: str, chain_name: str, pnl_data: Dic
         return f"❌ Error analyzing data with LLM (API Error): {e}"
 
 
-# Required endpoints for frontend polling
-@agent.on_rest_get("/agent_messages", AgentMessagesResponse)
-async def get_agent_messages(ctx: Context) -> AgentMessagesResponse:
-    return AgentMessagesResponse(messages=agent_messages)
-@agent.on_rest_get("/health", ChatResponse)
-async def health_check(ctx: Context) -> ChatResponse:
-    return ChatResponse(response="NakalTrade agent is healthy!")
+# Health check endpoint can remain for service monitoring
+@agent.on_rest_get("/health", HealthResponse)
+async def health_check(ctx: Context) -> HealthResponse:
+    return HealthResponse(response="NakalTrade agent is healthy!")
+
+# Include the protocol in the agent
+agent.include(chat_proto, publish_manifest=True)
 
 if __name__ == "__main__":
     print("🌟 NakalTrade Agent with Automated Payment Detection\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
