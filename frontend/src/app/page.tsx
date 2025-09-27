@@ -10,6 +10,13 @@ type Message = {
   content: string;
   isUser: boolean;
   agentName?: string;
+  timestamp?: number;
+};
+
+type AgentMessage = {
+  agent_name: string;
+  message: string;
+  timestamp: number;
 };
 
 export default function Home() {
@@ -27,22 +34,59 @@ export default function Home() {
   
   const { address, isConnected } = useAccount();
 
-  const API_URL = 'http://localhost:8100/chat';
+  const API_URL = 'http://localhost:8100';
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Poll for new agent messages
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_URL}/agent_messages`);
+        if (response.ok) {
+          const data: { messages: AgentMessage[] } = await response.json();
+          setMessages((prevMessages) => {
+            const newMessages: Message[] = [];
+            const lastTimestamp = prevMessages[prevMessages.length - 1]?.timestamp || 0;
+            
+            data.messages.forEach((agentMsg) => {
+              if (agentMsg.timestamp > lastTimestamp) {
+                newMessages.push({
+                  content: agentMsg.message,
+                  isUser: false,
+                  agentName: agentMsg.agent_name,
+                  timestamp: agentMsg.timestamp,
+                });
+              }
+            });
+
+            if (newMessages.length > 0) {
+              return [...prevMessages, ...newMessages];
+            }
+            return prevMessages;
+          });
+        }
+      } catch (error) {
+        console.error('Error polling for messages:', error);
+      }
+    }, 3000); // Poll every 3 seconds
+
+    return () => clearInterval(interval);
+  }, [messages]);
+
+
   const handleSendMessage = async () => {
     if (input.trim() === '') return;
 
-    const userMessage: Message = { content: input, isUser: true };
+    const userMessage: Message = { content: input, isUser: true, timestamp: Date.now() / 1000 };
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
     setIsTyping(true);
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: input }),
@@ -54,6 +98,7 @@ export default function Home() {
         content: data.response,
         isUser: false,
         agentName: 'NakalTrade',
+        timestamp: Date.now() / 1000,
       };
       setMessages((prev) => [...prev, agentResponse]);
 
@@ -63,6 +108,7 @@ export default function Home() {
         content: '⚠️ Could not connect to the NakalTrade agent. Please ensure it is running.',
         isUser: false,
         agentName: 'NakalTrade',
+        timestamp: Date.now() / 1000,
       };
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
