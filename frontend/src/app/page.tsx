@@ -83,7 +83,7 @@ export default function Home() {
     >
       <div
         className="nes-container with-title is-centered"
-        style={{ width: '90vw', maxWidth: '900px' }}
+        style={{ width: '90vw', maxWidth: '1200px' }}
       >
         <Image
           src="/KnuckleNakal.png"
@@ -96,7 +96,7 @@ export default function Home() {
         <div
           className="nes-container"
           style={{
-            height: '75vh',
+            height: '65vh',
             overflowY: 'auto',
             marginBottom: '1rem',
             padding: '1rem',
@@ -107,16 +107,25 @@ export default function Home() {
               <section
                 key={index}
                 className={`message -${msg.isUser ? 'right' : 'left'}`}
-                style={{ maxWidth: '75%' }}
+                style={{ 
+                  maxWidth: '75%',
+                  marginLeft: msg.isUser ? 'auto' : '0',
+                  marginRight: msg.isUser ? '0' : 'auto',
+                  display: 'block'
+                }}
               >
                 <div
                   className={`nes-balloon from-${
                     msg.isUser ? 'right' : 'left'
                   }`}
+                  style={{
+                    fontSize: '0.8rem',
+                    lineHeight: '1.2'
+                  }}
                   dangerouslySetInnerHTML={{
                     __html: `${
                       !msg.isUser
-                        ? `<span class="nes-text is-primary">${msg.agentName}</span><br>`
+                        ? `<span class="nes-text is-primary" style="font-size: 0.75rem;">${msg.agentName}</span><br>`
                         : ''
                     }<span style="color: black;">${msg.content.replace(
                       /\n/g,
@@ -125,14 +134,14 @@ export default function Home() {
                   }}
                 />
                 {!msg.isUser && (
-                  <p style={{ fontSize: '12px' }}>{msg.agentName}</p>
+                  <p style={{ fontSize: '10px' }}>{msg.agentName}</p>
                 )}
               </section>
             ))}
             <div ref={messagesEndRef} />
           </div>
         </div>
-        {isTyping && <p className="nes-text is-disabled">NakalTrade is analyzing...</p>}
+        {isTyping && <p className="nes-text is-disabled" style={{ fontSize: '0.8rem' }}>NakalTrade is analyzing...</p>}
         <div className="nes-field is-inline">
           <input
             type="text"
@@ -143,12 +152,14 @@ export default function Home() {
             onChange={(e) => setInput(e.target.value)}
             onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
             disabled={isTyping}
+            style={{ fontSize: '0.85rem' }}
           />
           <button
             type="button"
             className={`nes-btn ${isTyping ? 'is-disabled' : 'is-primary'}`}
             onClick={handleSendMessage}
             disabled={isTyping}
+            style={{ fontSize: '0.85rem' }}
           >
             Send
           </button>
