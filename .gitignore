@@ -143,4 +143,5 @@ secret.txt
 credentials.json
 service-account.json
 
-.DS_Store
+.DS_Store.DS_Store
+.env
