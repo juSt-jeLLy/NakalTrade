@@ -5,6 +5,7 @@ import time
 import json
 import asyncio
 import hashlib
+from decimal import Decimal
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from datetime import datetime
@@ -40,6 +41,8 @@ INSTITUTIONAL_AGENT_ADDRESS = "agent1qvkd7hxrh9p0eq0pg470j6lmkztgmu3ymrjnv65u9mz
 ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY")
 ASI_ONE_URL = "https://api.asi1.ai/v1/chat/completions"
 ONEINCH_PROXY_URL = os.getenv("1INCH_PROXY_URL")
+ONEINCH_API_KEY = os.getenv("ONEINCH_API_KEY")
+ONEINCH_SWAP_BASE_URL = "https://api.1inch.dev/swap/v6.1"
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS")
 AGENT_PRIVATE_KEY = os.getenv("AGENT_PRIVATE_KEY")
 POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY")
@@ -49,6 +52,7 @@ MOCK_TOKEN_ADDRESS = "0x33432627F302E9C6a3f62ACf7CB581AD57E995dB" # CORRECTED Mo
 # --- Globals ---
 one_inch_client: Optional[any] = None
 active_copy_trades: Dict[str, Any] = {}
+active_real_trades: Dict[str, Any] = {} # For the new real trade flow
 last_analyzed_chain: Optional[Dict[str, Any]] = None
 MAX_MESSAGES = 50
 CHAIN_NAME_TO_ID = {
@@ -58,6 +62,27 @@ CHAIN_NAME_TO_ID = {
     "base": 8453, "zksync era": 324, "linea": 59144,
     "avalanche": 43114, "avax": 43114,
 }
+
+CHAIN_RPC_ENV = {
+    "ethereum": "ETHEREUM_RPC_URL",
+    "eth": "ETHEREUM_RPC_URL",
+    "arbitrum": "ARBITRUM_RPC_URL",
+    "arb": "ARBITRUM_RPC_URL",
+    "optimism": "OPTIMISM_RPC_URL",
+    "polygon": "POLYGON_RPC_URL",
+    "matic": "POLYGON_RPC_URL",
+    "base": "BASE_RPC_URL",
+    "bnb": "BSC_RPC_URL",
+    "bnb chain": "BSC_RPC_URL",
+    "bsc": "BSC_RPC_URL",
+    "gnosis": "GNOSIS_RPC_URL",
+    "avalanche": "AVALANCHE_RPC_URL",
+    "avax": "AVALANCHE_RPC_URL",
+    "linea": "LINEA_RPC_URL",
+    "zksync era": "ZKSYNC_RPC_URL",
+}
+
+ONEINCH_NATIVE_TOKEN_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
 CHAIN_ID_TO_USDC_ADDRESS = {
     1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",       # Ethereum
@@ -149,6 +174,7 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
 
     analysis_match = re.search(r"analyze\s+(0x[a-fA-F0-9]{40})", message)
     copy_trade_match = re.search(r"copytrade\s+([a-zA-Z0-9]+)\s+with address\s+(0x[a-fA-F0-9]{40})(?:\s+with volume\s+([\d\.]+)\s+usd)?", message, re.IGNORECASE)
+    real_trade_match = re.search(r"realtrade\s+([0-9\.]+)\s+([a-zA-Z0-9]+)\s+into\s+(0x[a-fA-F0-9]{40})", message, re.IGNORECASE)
 
     if analysis_match:
         await orchestrate_analysis(ctx, sender, message, analysis_match)
@@ -156,10 +182,15 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         response_text = await handle_copy_trade(ctx, copy_trade_match, sender)
         response_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=response_text)])
         await ctx.send(sender, response_msg)
-    else:
-        response_text = "Sorry, I didn't understand. Try 'analyze {address} on {chain}' or 'copytrade {TOKEN} with address {YOUR_ADDRESS}'."
+    elif real_trade_match:
+        response_text = await handle_real_trade(ctx, real_trade_match, sender)
         response_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=response_text)])
         await ctx.send(sender, response_msg)
+    else:
+        response_text = "Sorry, I didn't understand. Try 'analyze {address} on {chain}', 'copytrade {TOKEN} with address {YOUR_ADDRESS}', or 'realtrade {amount} {to_token} into {your_wallet}'."
+        response_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=response_text)])
+        await ctx.send(sender, response_msg)
+
 
 @chat_proto.on_message(ChatAcknowledgement)
 async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
@@ -170,7 +201,7 @@ async def orchestrate_analysis(ctx: Context, original_sender: str, original_mess
 
     wallet_address = match.group(1)
     chain_name = await parse_chain_with_gpt(original_message)
-    
+
     if chain_name not in CHAIN_NAME_TO_ID:
         error_msg = f"Sorry, '{chain_name}' is not a supported chain."
         await ctx.send(original_sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=error_msg)]))
@@ -398,6 +429,238 @@ def execute_mock_token_transfer(ctx: Context, user_wallet: str, token_symbol: st
         ctx.logger.error(f"Failed to execute mock trade: {e}")
         return f"Failed to send mock token: {e}"
 
+async def handle_real_trade(ctx: Context, match: re.Match, sender: str) -> str:
+    """Initiates the real trade flow on Base, trading from USDC."""
+    global active_real_trades
+    
+    # Hardcode chain to Base
+    chain_name = "base"
+    chain_id = 8453
+    from_token_symbol = "USDC"
+    from_token_address = CHAIN_ID_TO_USDC_ADDRESS[chain_id]
+    from_token_decimals = 6 # USDC always has 6 decimals
+
+    real_payment_address = os.getenv("REAL_PAYMENT_ADDRESS")
+    if not real_payment_address:
+        return "❌ Missing REAL_PAYMENT_ADDRESS in config. Cannot proceed with trade."
+
+    # Parse command for the new simplified format
+    amount_str, to_token_symbol, user_wallet = match.groups()
+    to_token_symbol = to_token_symbol.upper()
+    
+    try:
+        to_token = await one_inch_client.search_token(chain_id, to_token_symbol)
+        if not to_token or "address" not in to_token:
+            return f"❌ Could not find destination token '{to_token_symbol}' on {chain_name}."
+
+        amount_decimal = Decimal(amount_str)
+        amount_in_smallest_unit = int(amount_decimal * (10**from_token_decimals))
+
+        payment_id = hashlib.sha256(f"{amount_str}{from_token_symbol}{to_token_symbol}{user_wallet}{time.time()}".encode()).hexdigest()[:12]
+        
+        active_real_trades[payment_id] = {
+            "user_wallet": user_wallet,
+            "to_token_symbol": to_token_symbol,
+            "to_token_address": to_token["address"],
+            "amount_str": amount_str,
+            "amount_in_smallest_unit": str(amount_in_smallest_unit),
+            "start_time": time.time(),
+            "sender": sender,
+        }
+        
+        asyncio.create_task(watch_for_real_trade_deposit(ctx, payment_id))
+
+        return f"""**🚀 Real Trade Initiated (Base Network)**
+**Request:** Swap {amount_str} USDC for {to_token_symbol}
+**Payment ID:** `{payment_id}`
+
+To proceed, please send **exactly `{amount_str} USDC`** to the agent's trading address:
+`{real_payment_address}`
+
+I am now monitoring the Base network for your deposit. This request will expire in 5 minutes."""
+
+    except Exception as e:
+        ctx.logger.error(f"Real trade initiation failed: {e}")
+        return f"❌ **Trade Initiation Failed:** {e}"
+
+async def watch_for_real_trade_deposit(ctx: Context, payment_id: str):
+    """Monitors the Base network for the user's USDC deposit."""
+    trade = active_real_trades.get(payment_id)
+    if not trade: return
+        
+    sender = trade["sender"]
+    start_time = trade["start_time"]
+    real_payment_address = os.getenv("REAL_PAYMENT_ADDRESS")
+    base_usdc_address = CHAIN_ID_TO_USDC_ADDRESS[8453]
+    expected_amount = trade["amount_in_smallest_unit"]
+
+    ctx.logger.info(f"👀 Watching for USDC deposit for real trade {payment_id} on Base...")
+
+    while time.time() - start_time < 300: # 5 minute timeout
+        try:
+            # Use the Etherscan V2 Universal API, as per user's correction
+            api_url = (
+                f"https://api.etherscan.io/v2/api?chainid=8453"
+                f"&module=account&action=tokentx&contractaddress={base_usdc_address}"
+                f"&address={real_payment_address}&page=1&offset=10&sort=desc"
+                f"&apikey={POLYGONSCAN_API_KEY}"
+            )
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(api_url)
+                response.raise_for_status()
+                data = response.json()
+
+            if data.get("status") == "1" and data.get("result"):
+                for tx in data["result"]:
+                    # We can't know the user's sending address, so we match on 'to', 'value', and 'timestamp'
+                    if (tx['to'].lower() == real_payment_address.lower() and
+                        tx['value'] == expected_amount and
+                        int(tx['timeStamp']) > start_time):
+                        
+                        ctx.logger.info(f"✅ Deposit DETECTED for {payment_id} in tx {tx['hash']}")
+                        
+                        # --- Execute Swap ---
+                        await execute_the_swap(ctx, payment_id, tx['hash'])
+                        return
+                        
+        except Exception as e:
+            ctx.logger.error(f"Error while watching for deposit {payment_id}: {e}")
+        
+        await asyncio.sleep(20) # Check every 20 seconds
+
+    # If loop finishes without payment
+    if payment_id in active_real_trades:
+        ctx.logger.info(f"⌛ Real trade request {payment_id} expired.")
+        timeout_msg = ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=f"Your real trade request `{payment_id}` has expired.")])
+        await ctx.send(sender, timeout_msg)
+        del active_real_trades[payment_id]
+
+async def execute_the_swap(ctx: Context, payment_id: str, deposit_tx_hash: str):
+    """Contains the logic to perform the 1inch swap after a deposit is confirmed."""
+    trade = active_real_trades.get(payment_id)
+    if not trade: return
+
+    sender = trade["sender"]
+    
+    # Hardcode chain and RPC for Base
+    chain_id = 8453
+    rpc_url = "https://base.drpc.org"
+    
+    # Config for the swap
+    real_payment_address = os.getenv("REAL_PAYMENT_ADDRESS")
+    real_private_key = os.getenv("REAL_PRIVATE_KEY")
+
+    try:
+        await ctx.send(sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=f"✅ Deposit confirmed in tx `{deposit_tx_hash[:12]}...`\n🚀 Executing swap on Base...")]))
+
+        # Initialize swap client with the dedicated real trade wallet
+        swap_client = OneInchSwapClient(ctx, chain_id, rpc_url, ONEINCH_API_KEY, real_payment_address, real_private_key)
+
+        # 1. Approve USDC for spending by 1inch router
+        approval_tx_hash = await swap_client.approve_token(CHAIN_ID_TO_USDC_ADDRESS[chain_id], int(trade["amount_in_smallest_unit"]))
+        if approval_tx_hash:
+            await ctx.send(sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=f"✅ USDC approval successful: `{approval_tx_hash}`. Waiting for confirmation...")]))
+            await asyncio.sleep(15)
+        
+        # 2. Get and execute swap transaction
+        swap_tx_hash = await swap_client.execute_swap(
+            CHAIN_ID_TO_USDC_ADDRESS[chain_id],
+            trade["to_token_address"],
+            int(trade["amount_in_smallest_unit"]),
+            trade["user_wallet"]
+        )
+
+        final_msg = f"✅ **Trade Complete!**\nSwapped {trade['amount_str']} USDC for {trade['to_token_symbol']}.\nTransaction: `{swap_tx_hash}`\nTokens sent to `{trade['user_wallet']}`."
+        await ctx.send(sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=final_msg)]))
+
+    except Exception as e:
+        ctx.logger.error(f"Swap execution failed for {payment_id}: {e}")
+        error_msg = f"❌ **Swap Failed:** After confirming your deposit, the final swap failed: {e}"
+        await ctx.send(sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=error_msg)]))
+    
+    finally:
+        if payment_id in active_real_trades:
+            del active_real_trades[payment_id]
+
+class OneInchSwapClient:
+    """Client for executing swaps via the 1inch Swap API."""
+    def __init__(self, ctx: Context, chain_id: int, rpc_url: str, api_key: str, public_key: str, private_key: str):
+        self._ctx = ctx
+        self.chain_id = chain_id
+        self.api_key = api_key
+        self.base_url = f"{ONEINCH_SWAP_BASE_URL}/{chain_id}"
+        self.public_key = public_key
+        self.private_key = private_key
+        self.w3 = Web3(HTTPProvider(rpc_url))
+
+    async def _api_call(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base_url}{endpoint}"
+        headers = {"Authorization": f"Bearer {self.api_key}", "accept": "application/json"}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            self._ctx.logger.info(f"Querying 1inch Swap API: {url} with params {params}")
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                raise Exception(f"1inch API Error: {resp.status_code} - {resp.text}")
+            return resp.json()
+
+    async def _send_transaction(self, tx: Dict[str, Any]) -> str:
+        # FIX: The 'from' field is often missing in 1inch API responses for approvals
+        if 'from' not in tx:
+            tx['from'] = self.public_key
+        
+        tx['from'] = self.w3.to_checksum_address(tx['from'])
+        tx['to'] = self.w3.to_checksum_address(tx['to'])
+        tx['gasPrice'] = int(tx['gasPrice'])
+        tx['value'] = int(tx['value'])
+        tx['nonce'] = self.w3.eth.get_transaction_count(self.public_key)
+        tx['chainId'] = self.chain_id # FIX: Add chain ID to the transaction
+
+        # FIX: Manually estimate gas if not provided by the API
+        if 'gas' not in tx:
+            tx['gas'] = self.w3.eth.estimate_gas(tx)
+
+        signed_tx = self.w3.eth.account.sign_transaction(tx, self.private_key)
+        tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        
+        self._ctx.logger.info(f"Transaction sent: {tx_hash.hex()}")
+        return tx_hash.hex()
+
+    async def approve_token(self, token_address: str, amount: int) -> Optional[str]:
+        """Check allowance and approve if necessary."""
+        # 1inch router address is universal for v6 on all EVM chains
+        spender_address = "0x111111125421ca6dc452d289314280a0f8842a65"
+        
+        allowance_params = {"tokenAddress": token_address, "walletAddress": self.public_key}
+        allowance_data = await self._api_call("/approve/allowance", allowance_params)
+        
+        current_allowance = int(allowance_data["allowance"])
+        if current_allowance >= amount:
+            self._ctx.logger.info("Allowance is sufficient, no approval needed.")
+            return None
+
+        self._ctx.logger.info("Allowance is insufficient, creating approval transaction.")
+        approve_params = {"tokenAddress": token_address, "amount": str(amount)}
+        approve_tx_data = await self._api_call("/approve/transaction", approve_params)
+        
+        return await self._send_transaction(approve_tx_data)
+
+    async def execute_swap(self, from_token: str, to_token: str, amount: int, receiver_address: str, slippage: int = 1) -> str:
+        """Get swap data and execute the transaction."""
+        swap_params = {
+            "src": from_token,
+            "dst": to_token,
+            "amount": str(amount),
+            "from": self.public_key,
+            "receiver": receiver_address, # Send swapped tokens to the user
+            "slippage": str(slippage),
+            "disableEstimate": "false",
+            "allowPartialFill": "false",
+        }
+        swap_tx_data = await self._api_call("/swap", swap_params)
+        return await self._send_transaction(swap_tx_data['tx'])
+
+# --- Portfolio Client ---
 class OneInchPortfolioClient:
     """Client for interacting with the 1inch Portfolio API via a proxy."""
     def __init__(self, ctx: Context):

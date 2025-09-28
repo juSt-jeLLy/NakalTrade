@@ -1,11 +1,13 @@
 # Core uAgents
-uagents
+uagents==0.22.9
 
 # For 1inch Integration
-httpx
+httpx==0.27.0
+requests==2.32.3
 
 # For Blockchain Interaction
-web3
-python-dotenv
-requests
-eth-account
+web3==7.13.0
+python-dotenv==1.0.1
+py-solc-x==2.0.2
+eth-account==0.13.7
+hyperon
